@@ -4,6 +4,10 @@ Opening Range Breakout platform for raw-data ingestion, data quality auditing, p
 
 The repository no longer ships a built-in trading strategy. Users provide their own Python strategy plug-in through `strategy_plugin.module` and `strategy_plugin.callable` in the config.
 
+Architecture overview:
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ## Data Engineering Highlights
 
 - Reproducible raw-data manifests with file-level SHA-256 hashes and a combined dataset fingerprint
