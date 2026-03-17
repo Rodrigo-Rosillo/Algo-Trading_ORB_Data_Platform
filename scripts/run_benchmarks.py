@@ -577,7 +577,7 @@ def main() -> int:
     cfg_text = config_path.read_text(encoding="utf-8")
     cfg = yaml.safe_load(cfg_text) or {}
 
-    symbol = str(cfg.get("symbol", "SOLUSDT"))
+    symbol = str(cfg.get("symbol", "BTCUSDT"))
     timeframe = str(cfg.get("timeframe", "30m"))
     tf_min = parse_timeframe_to_minutes(timeframe)
 

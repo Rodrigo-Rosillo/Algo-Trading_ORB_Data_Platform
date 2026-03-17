@@ -38,8 +38,8 @@ def _trade_key_from_order_id(order_id: str) -> Tuple[str, str, str]:
     """Return (trade_id, signal_type, leg) where leg in {'ENTRY','EXIT'}.
 
     Expected formats:
-      T00000_20210111T170000Z_downtrend_breakdown_ENTRY
-      T00000_20210111T170000Z_downtrend_breakdown_EXIT
+      T00000_20210111T170000Z_signal_type_ENTRY
+      T00000_20210111T170000Z_signal_type_EXIT
 
     NOTE: signal types may contain underscores, so we cannot take only the last segment.
     """

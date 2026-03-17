@@ -1,6 +1,11 @@
 __pycache__/
 .venv/
 .pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
+test_tmp_workspace/
+tmp_pytest_base/
+.coverage
 *.ipynb_checkpoints
 .env
 .env.*
@@ -23,4 +28,3 @@ data/processed/*
 data/heartbeat*
 !data/README.md
 !data/manifest.json
-
