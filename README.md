@@ -1,6 +1,6 @@
 # ORB Data Platform
 
-Generic Opening Range Breakout platform for data ingestion, data quality checks, backtesting, forward shadow runs, and live/testnet execution.
+Opening Range Breakout platform for data ingestion, data quality checks, backtesting, forward shadow runs, and live/testnet execution.
 
 The repository no longer ships a built-in trading strategy. Users provide their own Python strategy plug-in through `strategy_plugin.module` and `strategy_plugin.callable` in the config.
 
