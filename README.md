@@ -1,16 +1,27 @@
 # ORB Data Platform
 
-Opening Range Breakout platform for data ingestion, data quality checks, backtesting, forward shadow runs, and live/testnet execution.
+Opening Range Breakout platform for raw-data ingestion, data quality auditing, parquet curation, backtesting, forward shadow runs, and live/testnet execution.
 
 The repository no longer ships a built-in trading strategy. Users provide their own Python strategy plug-in through `strategy_plugin.module` and `strategy_plugin.callable` in the config.
 
+## Data Engineering Highlights
+
+- Reproducible raw-data manifests with file-level SHA-256 hashes and a combined dataset fingerprint
+- Data quality auditing for missing, duplicate, misaligned, and invalid UTC bars with JSON and HTML outputs
+- Curated parquet builds with `valid_days.csv`, `invalid_days.csv`, and processed manifests that preserve input and config lineage
+- Deterministic run artifacts that capture config, dataset, script, git, and output hashes for auditability
+- SQLite WAL state persistence with integrity checks, JSON-to-SQLite migration, and crash-recovery coverage
+- Dockerized runtime helpers including heartbeat health checks, watchdog monitoring, and Telegram reporting
+- Unit, integration, and property-based tests covering reconciliation, recovery, risk controls, and repo hygiene
+
 ## What Stays In Scope
 
-- Raw CSV hashing and data quality checks
-- Processed parquet generation and valid-day detection
+- Raw CSV hashing, dataset lineage, and data quality checks
+- Processed parquet curation and valid-day detection
+- Deterministic reports and reproducible run metadata
 - Spot and futures backtest engines
 - Forward shadow execution and live/testnet runners
-- Risk controls, state persistence, and ops tooling
+- Risk controls, SQLite state persistence and recovery, watchdog monitoring, Telegram reporting, and ops tooling
 
 ## What Is Intentionally Not Included
 
@@ -91,7 +102,7 @@ Required output behavior:
 
 Starter file:
 
-- [user_strategy.py](/c:/Users/wrodr/Documents/Remote%20Work/CV%20proyecto/Algo-Trading_ORB_Data_Platform/user_strategy.py)
+- [user_strategy.py](user_strategy.py)
 
 ## Main Commands
 
@@ -132,12 +143,45 @@ python scripts/forward_test.py --config config_forward_test.yaml --mode shadow -
 python scripts/forward_test.py --config config_forward_test.yaml --mode testnet --source live
 ```
 
+Render the baseline HTML report:
+
+```bash
+python scripts/render_report.py
+```
+
+Generate a forward-test divergence report:
+
+```bash
+python scripts/forward_test_report.py --run-id <RUN_ID>
+```
+
+## Generated Artifacts
+
+Typical workflows emit auditable artifacts rather than only console output:
+
+- `data/manifest.json` stores file-level hashes and a combined dataset fingerprint
+- `reports/data_quality/quality.json` and `quality.html` summarize completeness and timestamp issues
+- `data/processed/*.parquet`, `valid_days.csv`, `invalid_days.csv`, and `data/processed/manifest.json` record the curated dataset build
+- `reports/baseline/` includes `results.json`, `trades.csv`, `equity_curve.csv`, `run_metadata.json`, `hashes.json`, and `report.html`
+- `reports/forward_test/<run_id>/` includes `events.jsonl`, `orders.csv`, `fills.csv`, `positions.csv`, state snapshots, and `forward_test_report.html`
+
+## Monitoring And Reporting
+
+The platform still includes operational monitoring helpers for deployed runs:
+
+- `ops/watchdog.py` monitors heartbeat freshness, container or process health, and trade log activity
+- `ops/daily_report.py` builds a daily performance summary and can send Telegram updates when credentials are configured
+- forward and live runners maintain heartbeat files used by Docker health checks and watchdog-style monitoring
+
+See `RUNBOOK.md` for deployment and monitoring details.
+
 ## Data Layout
 
-- [data/README.md](/c:/Users/wrodr/Documents/Remote%20Work/CV%20proyecto/Algo-Trading_ORB_Data_Platform/data/README.md)
+- [data/README.md](data/README.md)
 - `data/raw/` is intentionally empty in git
 - `data/processed/` is intentionally empty in git
 - `reports/` is intentionally empty in git
+- generated artifacts stay local, and repo scrub tests guard against committing them by mistake
 
 ## Tests
 
@@ -148,7 +192,7 @@ pytest tests/unit -v
 pytest tests/integration -v
 ```
 
-The test suite covers the plug-in contract, execution engines, live/testnet services, and a scrub regression check that guards against reintroducing legacy strategy identifiers or committed artifacts.
+The test suite covers the plug-in contract, execution engines, live/testnet services, SQLite crash recovery, reconciliation logic, property-based risk checks, and scrub regressions that guard against reintroducing legacy strategy identifiers or committed artifacts.
 
 ## Safety Note
 
