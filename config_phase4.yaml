@@ -1,0 +1,70 @@
+# Risk-controls-focused preset for the generic ORB platform
+
+symbol: BTCUSDT
+timeframe: 30m
+
+valid_days: data/processed/valid_days.csv
+
+timezone:
+  data_timezone: "UTC"
+  orb_times_timezone: "UTC"
+
+strategy_plugin:
+  module: user_strategy
+  callable: build_strategy
+
+strategy: {}
+
+risk:
+  initial_capital: 10000
+  position_size: 0.95
+
+fees:
+  taker_fee_rate: 0.0005
+
+leverage:
+  enabled: true
+  max_leverage: 1
+
+risk_controls:
+  enabled: true
+  max_position_margin_frac: 0.95
+  max_leverage: 2.0
+  max_daily_loss_pct: 0.03
+  max_drawdown_pct: 0.20
+  max_consecutive_losses: 4
+  max_exposure_bars: 48
+  kill_switch:
+    max_data_gap_bars: 3
+    max_order_rejects_per_day: 2
+    max_margin_ratio: 0.80
+
+forward_test:
+  mode: shadow
+  source: replay
+  replay:
+    start: null
+    end: null
+  out_dir: /data/reports/forward_test
+  bar_lookback: 1000
+  live:
+    market: futures
+    bootstrap_limit: 1000
+    bootstrap_max_age_bars: null
+    max_backoff_seconds: 60
+    heartbeat_seconds: 120
+    stale_check_interval_seconds: 30
+  testnet:
+    base_url: "https://demo-fapi.binance.com"
+    recv_window_ms: 5000
+    poll_interval_seconds: 2
+    cancel_open_orders_on_exit: true
+    flatten_on_mismatch: false
+    smoke_qty: 0.10
+    smoke_auto_flatten: true
+    max_retries: 6
+    base_backoff_seconds: 0.5
+    max_backoff_seconds: 20
+  execution_model:
+    delay_bars: 1
+    slippage_bps: 0

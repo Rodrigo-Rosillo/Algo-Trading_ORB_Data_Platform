@@ -1,0 +1,31 @@
+services:
+  trader:
+    build: .
+    restart: "on-failure:10"
+    env_file: .env
+    environment:
+      # Explicit paths ensure all writes land in the persisted volume,
+      # and emergency_flatten.py resolves the same db without extra flags.
+      - STATE_DB_PATH=/data/state.db
+      - HEARTBEAT_PATH=/data/heartbeat
+    volumes:
+      - trader_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD-SHELL", "find /data/heartbeat -mmin -10 -type f | grep -q ."]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+
+volumes:
+  trader_data:
+    driver: local

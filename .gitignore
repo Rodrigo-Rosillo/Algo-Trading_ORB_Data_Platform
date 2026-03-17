@@ -1,0 +1,26 @@
+__pycache__/
+.venv/
+.pytest_cache/
+*.ipynb_checkpoints
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+.hypothesis/
+docker-compose.override.yml
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+!reports/README.md
+
+# Local datasets and derived files
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/heartbeat*
+!data/README.md
+!data/manifest.json
+

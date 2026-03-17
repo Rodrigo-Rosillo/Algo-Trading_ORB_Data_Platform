@@ -1,0 +1,580 @@
+import os
+
+# Determinism locks (must be set before Python does much work)
+os.environ["PYTHONHASHSEED"] = "0"
+
+import argparse
+import hashlib
+import json
+import asyncio
+import signal
+import platform
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Ensure repo root is on sys.path so `backtester`, `strategy`, and `forward` imports work
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from core.utils import sha256_file  # noqa: E402
+from backtester.risk import risk_limits_from_config  # noqa: E402
+from forward.artifacts import (  # noqa: E402
+    build_orders_fills_positions,
+    build_signals_df,
+    write_csv,
+    write_jsonl,
+)
+from forward.replay import load_processed_parquet  # noqa: E402
+from forward.shadow import run_shadow_futures  # noqa: E402
+from forward.live_shadow import run_live_shadow  # noqa: E402
+from forward.live_testnet import run_live_testnet  # noqa: E402
+from forward.schemas import FILLS_COLUMNS, ORDERS_COLUMNS, POSITIONS_COLUMNS, SIGNALS_COLUMNS, validate_df_columns  # noqa: E402
+from forward.utils import ensure_repo_path, maybe_get_forward_cfg, parse_utc_ts, utc_run_id  # noqa: E402
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def get_git_head() -> str:
+    """Best-effort git HEAD hash (empty if not available)."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out
+    except Exception:
+        return ""
+
+
+def _parse_leverage(cfg: dict[str, Any]) -> float:
+    lev_cfg = cfg.get("leverage") or {}
+    if not isinstance(lev_cfg, dict):
+        raise ValueError("leverage must be a mapping when provided")
+
+    leverage = float(lev_cfg.get("max_leverage", 1.0)) if bool(lev_cfg.get("enabled", True)) else 1.0
+    if leverage != float(int(leverage)):
+        raise ValueError(
+            f"leverage.max_leverage must be a whole number, got {leverage}. "
+            f"Binance applies int() truncation. Use {int(leverage)} or {int(leverage) + 1}."
+        )
+    leverage = float(int(leverage))
+    return leverage
+
+def write_skeleton(run_dir: Path) -> None:
+    """Create placeholder artifacts for not-yet-implemented forward-test modes."""
+    validate_df_columns(pd.DataFrame(columns=SIGNALS_COLUMNS), SIGNALS_COLUMNS, "signals.csv")
+    validate_df_columns(pd.DataFrame(columns=ORDERS_COLUMNS), ORDERS_COLUMNS, "orders.csv")
+    validate_df_columns(pd.DataFrame(columns=FILLS_COLUMNS), FILLS_COLUMNS, "fills.csv")
+    validate_df_columns(pd.DataFrame(columns=POSITIONS_COLUMNS), POSITIONS_COLUMNS, "positions.csv")
+    for fname, cols in [
+        ("signals.csv", SIGNALS_COLUMNS),
+        ("orders.csv", ORDERS_COLUMNS),
+        ("fills.csv", FILLS_COLUMNS),
+        ("positions.csv", POSITIONS_COLUMNS),
+    ]:
+        p = run_dir / fname
+        if not p.exists() or p.stat().st_size == 0:
+            p.write_text(",".join(cols) + "\n", encoding="utf-8")
+    (run_dir / "events.jsonl").touch(exist_ok=True)
+
+
+def _append_event_jsonl(path: Path, event: dict) -> None:
+    """Append a single JSON event line (best-effort)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception:
+        # Never crash the runner because logging failed.
+        pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write text plus trailing newline to path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(f"{text}\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _heartbeat_loop(stop_evt: threading.Event, hb_path: Path, interval_s: int) -> None:
+    """Best-effort heartbeat writer for Docker healthchecks."""
+    interval = max(1, int(interval_s))
+    while not stop_evt.is_set():
+        try:
+            _atomic_write_text(hb_path, datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+        for _ in range(interval):
+            if stop_evt.is_set():
+                break
+            time.sleep(1)
+
+
+async def _run_with_graceful_sigint(coro: asyncio.Future, stop_event: asyncio.Event):
+    """Run an async coroutine with a SIGINT handler that triggers stop_event.
+
+    This prevents Ctrl+C from hard-cancelling the event loop (which can leave
+    websocket close tasks pending on Windows) and instead requests a clean stop.
+
+    Second Ctrl+C falls back to the prior handler (hard interrupt).
+    """
+
+    loop = asyncio.get_running_loop()
+    old_handler = signal.getsignal(signal.SIGINT)
+    sigint_count = {"n": 0}
+
+    def handler(sig, frame):  # noqa: ARG001
+        sigint_count["n"] += 1
+        if sigint_count["n"] == 1:
+            try:
+                loop.call_soon_threadsafe(stop_event.set)
+            except Exception:
+                try:
+                    stop_event.set()
+                except Exception:
+                    pass
+        else:
+            # Escalate on repeated interrupts.
+            try:
+                if callable(old_handler):
+                    old_handler(sig, frame)
+                else:
+                    raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                raise
+
+    try:
+        signal.signal(signal.SIGINT, handler)
+    except Exception:
+        # If we can't install a handler, just run normally.
+        return await coro
+
+    try:
+        return await coro
+    finally:
+        try:
+            signal.signal(signal.SIGINT, old_handler)
+        except Exception:
+            pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Phase 5 forward test runner")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config_forward_test.yaml",
+        help="Path to YAML config (relative to repo root or absolute).",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=None,
+        choices=["shadow", "testnet"],
+        help="Forward-test mode. If omitted, uses config.forward_test.mode or 'shadow'.",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        choices=["replay", "live"],
+        help="Data source. If omitted, uses config.forward_test.source or 'replay'.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Override output directory for this run (will create run_id subfolder).",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional run id. Default is current UTC timestamp, e.g. 20260214T210300Z.",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        help="Replay start timestamp/date (UTC). Example: 2025-01-01",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default=None,
+        help="Replay end timestamp/date (UTC). Example: 2025-06-30",
+    )
+
+    # Live mode controls
+    parser.add_argument(
+        "--max-bars",
+        type=int,
+        default=None,
+        help="(live) Stop after processing N closed bars.",
+    )
+    parser.add_argument(
+        "--duration-minutes",
+        type=int,
+        default=None,
+        help="(live) Stop after N minutes of wall-clock time.",
+    )
+
+    # Testnet mode controls
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="(testnet) Place a tiny test order on Binance Futures TESTNET and exit.",
+    )
+    args = parser.parse_args()
+
+    # Resolve config path
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = (REPO_ROOT / config_path).resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+
+    cfg_text = config_path.read_text(encoding="utf-8")
+    cfg = yaml.safe_load(cfg_text) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError("Config must be a YAML mapping")
+
+    ft_cfg = maybe_get_forward_cfg(cfg)
+    mode = args.mode or str(ft_cfg.get("mode", "shadow"))
+    source = args.source or str(ft_cfg.get("source", "replay"))
+
+    out_root = args.out or ft_cfg.get("out_dir") or "reports/forward_test"
+    out_root = ensure_repo_path(REPO_ROOT, str(out_root))
+
+    run_id = args.run_id or utc_run_id()
+    run_dir = out_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    started_utc = datetime.now(timezone.utc).isoformat()
+
+    # Persist config used (for audit/repro)
+    (run_dir / "config_used.yaml").write_text(cfg_text, encoding="utf-8")
+
+    # Risk limits snapshot
+    try:
+        risk_limits = risk_limits_from_config(cfg)
+        risk_limits_dict = risk_limits.to_dict() if hasattr(risk_limits, "to_dict") else {}
+    except Exception:
+        risk_limits = None
+        risk_limits_dict = {}
+
+    # Metadata placeholders
+    note = ""
+    parquet_path_used = ""
+    parquet_sha256 = ""
+    rows_used = 0
+
+    events: list[dict] = []
+
+    if source == "replay" and mode == "shadow":
+        note = "Phase 5 Step 2: replay source + shadow execution (deterministic)."
+
+        # Strategy/execution params
+        symbol = str(cfg.get("symbol", "BTCUSDT"))
+        timeframe = str(cfg.get("timeframe", "30m"))
+
+        exec_cfg = (ft_cfg.get("execution_model") or {}) if isinstance(ft_cfg, dict) else {}
+        delay_bars = int(exec_cfg.get("delay_bars", 1))
+        slippage_bps = float(exec_cfg.get("slippage_bps", 0.0))
+
+        # Replay bounds (CLI overrides config)
+        replay_cfg = ft_cfg.get("replay") if isinstance(ft_cfg.get("replay"), dict) else {}
+        start_utc = parse_utc_ts(args.start) or parse_utc_ts((replay_cfg or {}).get("start"))
+        end_utc = parse_utc_ts(args.end) or parse_utc_ts((replay_cfg or {}).get("end"))
+
+        # Valid days
+        valid_days_path = ensure_repo_path(
+            REPO_ROOT, str(cfg.get("valid_days", "data/processed/valid_days.csv"))
+        )
+        valid_days_df = pd.read_csv(valid_days_path)
+        valid_days = set(pd.to_datetime(valid_days_df["date_utc"], utc=True).dt.date)
+
+        # Load replay dataset
+        df_raw, parquet_path = load_processed_parquet(
+            REPO_ROOT, symbol=symbol, timeframe=timeframe, start_utc=start_utc, end_utc=end_utc
+        )
+        parquet_path_used = str(parquet_path)
+        parquet_sha256 = sha256_file(parquet_path)
+        rows_used = int(len(df_raw))
+
+        events.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "RUN_START",
+                "mode": mode,
+                "source": source,
+                "rows": rows_used,
+                "start_utc": start_utc.isoformat() if start_utc is not None else "",
+                "end_utc": end_utc.isoformat() if end_utc is not None else "",
+            }
+        )
+
+        shadow_res = run_shadow_futures(
+            df_raw=df_raw,
+            valid_days=valid_days,
+            cfg=cfg,
+            delay_bars=delay_bars,
+            slippage_bps=slippage_bps,
+            fee_mult=1.0,
+            funding_rate_per_8h=float(cfg.get("funding", {}).get("rate_per_8h", 0.0)) if isinstance(cfg.get("funding"), dict) else 0.0,
+            risk_limits=risk_limits,
+        )
+
+        # Artifacts
+
+        risk_ev = (shadow_res.stats.get("risk") or {}).get("events") if isinstance(shadow_res.stats, dict) else None
+        signals_df = build_signals_df(shadow_res.df_sig, symbol=symbol)
+        orders_df, fills_df, positions_df, derived_events = build_orders_fills_positions(
+            df_sig=shadow_res.df_sig,
+            trades=shadow_res.trades,
+            equity_curve=shadow_res.equity_curve,
+            symbol=symbol,
+            delay_bars=delay_bars,
+            valid_days=valid_days,
+            risk_events=risk_ev,
+        )
+        # Add risk events (if any)
+        if isinstance(risk_ev, list):
+            for e in risk_ev:
+                events.append({"ts": str(e.get("ts", "")), "type": "RISK", **e})
+
+        events.extend(derived_events)
+        events.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "RUN_END",
+                "final_equity": shadow_res.stats.get("final_equity"),
+                "trades": shadow_res.stats.get("trades"),
+            }
+        )
+
+        if signals_df.empty and len(signals_df.columns) == 0:
+            signals_df = pd.DataFrame(columns=SIGNALS_COLUMNS)
+        if orders_df.empty and len(orders_df.columns) == 0:
+            orders_df = pd.DataFrame(columns=ORDERS_COLUMNS)
+        if fills_df.empty and len(fills_df.columns) == 0:
+            fills_df = pd.DataFrame(columns=FILLS_COLUMNS)
+        if positions_df.empty and len(positions_df.columns) == 0:
+            positions_df = pd.DataFrame(columns=POSITIONS_COLUMNS)
+
+        validate_df_columns(signals_df, SIGNALS_COLUMNS, "signals.csv")
+        validate_df_columns(orders_df, ORDERS_COLUMNS, "orders.csv")
+        validate_df_columns(fills_df, FILLS_COLUMNS, "fills.csv")
+        validate_df_columns(positions_df, POSITIONS_COLUMNS, "positions.csv")
+
+        write_csv(signals_df, run_dir / "signals.csv", SIGNALS_COLUMNS)
+        write_csv(orders_df, run_dir / "orders.csv", ORDERS_COLUMNS)
+        write_csv(fills_df, run_dir / "fills.csv", FILLS_COLUMNS)
+        write_csv(positions_df, run_dir / "positions.csv", POSITIONS_COLUMNS)
+        write_jsonl(run_dir / "events.jsonl", events)
+
+        (run_dir / "shadow_stats.json").write_text(
+            json.dumps(shadow_res.stats, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+    elif source == "live" and mode == "shadow":
+        note = "Phase 5 Step 3: live source + shadow execution (non-deterministic)."
+
+        symbol = str(cfg.get("symbol", "BTCUSDT"))
+        timeframe = str(cfg.get("timeframe", "30m"))
+
+        initial_capital = float(cfg["risk"]["initial_capital"])
+        position_size = float(cfg["risk"]["position_size"])
+        taker_fee_rate = float(cfg["fees"]["taker_fee_rate"])
+
+        leverage = _parse_leverage(cfg)
+
+        exec_cfg = (ft_cfg.get("execution_model") or {}) if isinstance(ft_cfg, dict) else {}
+        delay_bars = int(exec_cfg.get("delay_bars", 1))
+        slippage_bps = float(exec_cfg.get("slippage_bps", 0.0))
+
+        # Ensure skeleton exists. Live runner appends incrementally.
+        write_skeleton(run_dir)
+
+        # Run async live loop (writes artifacts into run_dir).
+        # Install a SIGINT handler so Ctrl+C requests a clean stop instead of
+        # abruptly cancelling the event loop (helps avoid websocket shutdown warnings).
+        async def _runner():
+            stop_event = asyncio.Event()
+            return await _run_with_graceful_sigint(
+                run_live_shadow(
+                    run_dir=run_dir,
+                    cfg=cfg,
+                    ft_cfg=ft_cfg,
+                    risk_limits=risk_limits,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    initial_capital=initial_capital,
+                    position_size=position_size,
+                    taker_fee_rate=taker_fee_rate,
+                    leverage=leverage,
+                    delay_bars=delay_bars,
+                    slippage_bps=slippage_bps,
+                    funding_rate_per_8h=float(cfg.get("funding", {}).get("rate_per_8h", 0.0)) if isinstance(cfg.get("funding"), dict) else 0.0,
+                    max_bars=args.max_bars,
+                    duration_minutes=args.duration_minutes,
+                    external_stop_event=stop_event,
+                ),
+                stop_event,
+            )
+
+        asyncio.run(_runner())
+
+    elif source == "live" and mode == "testnet":
+        note = "Phase 5 Step 4: live source + Binance futures TESTNET order placement."
+
+        symbol = str(cfg.get("symbol", "BTCUSDT"))
+        timeframe = str(cfg.get("timeframe", "30m"))
+
+        initial_capital = float(cfg["risk"]["initial_capital"])
+        position_size = float(cfg["risk"]["position_size"])
+        taker_fee_rate = float(cfg["fees"]["taker_fee_rate"])
+
+        leverage = _parse_leverage(cfg)
+
+        exec_cfg = (ft_cfg.get("execution_model") or {}) if isinstance(ft_cfg, dict) else {}
+        delay_bars = int(exec_cfg.get("delay_bars", 1))
+        slippage_bps = float(exec_cfg.get("slippage_bps", 0.0))
+
+        write_skeleton(run_dir)
+
+        exit_code = 0
+
+        async def _runner():
+            stop_event = asyncio.Event()
+            return await _run_with_graceful_sigint(
+                run_live_testnet(
+                    run_dir=run_dir,
+                    cfg=cfg,
+                    ft_cfg=ft_cfg,
+                    risk_limits=risk_limits,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    initial_capital=initial_capital,
+                    position_size=position_size,
+                    taker_fee_rate=taker_fee_rate,
+                    leverage=leverage,
+                    delay_bars=delay_bars,
+                    slippage_bps=slippage_bps,
+                    max_bars=args.max_bars,
+                    duration_minutes=args.duration_minutes,
+                    smoke_test=bool(args.smoke_test),
+                    external_stop_event=stop_event,
+                ),
+                stop_event,
+            )
+
+        try:
+            asyncio.run(_runner())
+        except KeyboardInterrupt:
+            # Second Ctrl+C escalates to a hard interrupt.
+            _append_event_jsonl(
+                run_dir / "events.jsonl",
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "type": "LIVE_RUN_END",
+                    "bars_processed": None,
+                    "final_equity": None,
+                    "reason": "KEYBOARD_INTERRUPT",
+                },
+            )
+            exit_code = 130
+
+    else:
+        # Other combinations are wired in later Phase 5 steps.
+        note = f"Not implemented yet: mode={mode}, source={source}. Implemented: replay+shadow (Step 2), live+shadow (Step 3)."
+        write_skeleton(run_dir)
+
+    meta = {
+        "run_id": run_id,
+        "started_utc": started_utc,
+        "mode": mode,
+        "source": source,
+        "out_dir": str(run_dir),
+        "config_path": str(config_path),
+        "config_sha256": sha256_text(cfg_text),
+        "dataset": {
+            "processed_parquet": parquet_path_used,
+            "processed_parquet_sha256": parquet_sha256,
+            "rows_used": rows_used,
+            "start_utc": args.start,
+            "end_utc": args.end,
+        },
+        "repo_git_head": get_git_head(),
+        "python": sys.version.replace("\n", " "),
+        "platform": platform.platform(),
+        "risk_limits": risk_limits_dict,
+        "note": note,
+    }
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    print(f"[forward_test] created run folder: {run_dir}")
+    print("[forward_test] artifacts:")
+    for name in [
+        "signals.csv",
+        "orders.csv",
+        "fills.csv",
+        "positions.csv",
+        "events.jsonl",
+        "run_metadata.json",
+    ]:
+        if (run_dir / name).exists():
+            print("  -", name)
+    if (run_dir / "shadow_stats.json").exists():
+        print("  - shadow_stats.json")
+
+    if source == "replay" and mode == "shadow":
+        print("[forward_test]  replay+shadow run completed.")
+    elif source == "live" and mode == "shadow":
+        print("[forward_test]  live+shadow run completed.")
+    elif source == "live" and mode == "testnet":
+        print("[forward_test]  live+testnet run completed.")
+    else:
+        print("[forward_test] [i] Not implemented for this mode/source yet.")
+    try:
+        return int(locals().get("exit_code", 0))
+    except Exception:
+        return 0
+
+
+def _main_with_heartbeat() -> int:
+    hb_path = Path(os.environ.get("HEARTBEAT_PATH", "/data/heartbeat"))
+    stop_evt = threading.Event()
+    t = threading.Thread(
+        target=_heartbeat_loop,
+        args=(stop_evt, hb_path, 60),
+        daemon=True,
+    )
+    t.start()
+    try:
+        return main()
+    finally:
+        stop_evt.set()
+        t.join(timeout=2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main_with_heartbeat())
+
