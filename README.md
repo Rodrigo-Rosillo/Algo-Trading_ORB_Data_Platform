@@ -40,6 +40,32 @@ python scripts/walk_forward.py --help
 python scripts/forward_test.py --help
 ```
 
+### First Successful Run
+
+Use this sequence to validate the platform end to end with your own raw files:
+
+1. Place source CSV files in `data/raw/`.
+2. Build the raw-data manifest and quality report:
+
+```bash
+python scripts/hash_data.py --data-dir data/raw --patterns *.csv --out data/manifest.json
+python scripts/data_quality.py --manifest data/manifest.json --out-dir reports/data_quality
+```
+
+3. Build the processed parquet dataset:
+
+```bash
+python scripts/build_parquet.py --raw-manifest data/manifest.json --out-dir data/processed
+```
+
+4. Run the backtest entrypoint:
+
+```bash
+python scripts/run_baseline.py --engine futures --config config.yaml
+```
+
+If `config.yaml` still points to the starter `user_strategy.py`, the run will verify the full pipeline with a no-op strategy plug-in. Replace that plug-in when you are ready to test your own strategy logic.
+
 ## Strategy Plug-In Contract
 
 Set the plug-in in `config.yaml`:
