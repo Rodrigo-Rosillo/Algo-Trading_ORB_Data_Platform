@@ -746,7 +746,7 @@ class BinanceFuturesTestnetBroker:
     def get_algo_open_orders(self, *, symbol: str) -> Any:
         return self._request(
             "GET",
-            "/fapi/v1/algoOpenOrders",
+            "/fapi/v1/openAlgoOrders",
             params={"symbol": symbol},
             signed=True,
         )
@@ -761,7 +761,7 @@ class BinanceFuturesTestnetBroker:
     def cancel_all_algo_open_orders(self, *, symbol: str) -> Any:
         return self._request(
             "DELETE",
-            "/fapi/v1/algoOpenOrders",
+            "/fapi/v1/openAlgoOrders",
             params={"symbol": symbol},
             signed=True,
         )

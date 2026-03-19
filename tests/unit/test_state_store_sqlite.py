@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from forward.state_store import load_state as load_legacy_state
 from forward.state_store_sqlite import OpenPositionState, RunnerState, SQLiteStateStore
 
 
@@ -64,3 +65,53 @@ def test_sqlite_state_store_round_trip_with_crash_reopen(tmp_path) -> None:
     assert loaded.open_position.tp_price == pytest.approx(expected.open_position.tp_price, abs=1e-12)
     assert loaded.open_position.sl_price == pytest.approx(expected.open_position.sl_price, abs=1e-12)
     assert loaded.open_position.opened_at == expected.open_position.opened_at
+
+
+def test_json_snapshot_round_trip_preserves_opened_at(tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    json_path = tmp_path / "state.json"
+    state = RunnerState(
+        open_position=OpenPositionState(
+            symbol="BTCUSDT",
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            entry_time_utc="2024-01-15T14:00:00+00:00",
+            entry_order_id=123456,
+            tp_order_id=123457,
+            sl_order_id=123458,
+            tp_price=110.0,
+            sl_price=95.0,
+            opened_at="2024-01-15T14:00:05+00:00",
+        ),
+    )
+
+    with SQLiteStateStore(db_path=db_path) as store:
+        store.export_state_json_snapshot(json_path, state)
+
+    loaded = load_legacy_state(json_path)
+    assert loaded.open_position is not None
+    assert loaded.open_position.opened_at == "2024-01-15T14:00:05+00:00"
+
+
+def test_save_state_assigns_opened_at_when_missing(tmp_path) -> None:
+    db_path = tmp_path / "state.db"
+    state = RunnerState(
+        open_position=OpenPositionState(
+            symbol="BTCUSDT",
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            entry_time_utc="2024-01-15T14:00:00+00:00",
+            entry_order_id=123456,
+        ),
+    )
+
+    with SQLiteStateStore(db_path=db_path) as store:
+        store.save_state(state)
+        loaded = store.load_state()
+
+    assert state.open_position is not None
+    assert state.open_position.opened_at is not None
+    assert loaded.open_position is not None
+    assert loaded.open_position.opened_at == state.open_position.opened_at

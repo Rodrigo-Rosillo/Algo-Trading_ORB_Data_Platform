@@ -78,6 +78,7 @@ def _order_exec_qty(resp: Any) -> float:
 
 PROTECTION_RECENCY_WINDOW_SECONDS = 180
 PROTECTION_AMBIGUITY_RETRY_WINDOW_SECONDS = 30
+PROTECTION_POLL_GRACE_SECONDS = 10
 PROTECTION_PRICE_TOL_TICKS = 1
 ENTRY_AMBIGUITY_VERIFY_ATTEMPTS = 3
 ENTRY_AMBIGUITY_VERIFY_SLEEP_SECONDS = 0.5
@@ -88,6 +89,18 @@ def _compact_json(data: Any) -> str:
         return json.dumps(data, sort_keys=True, separators=(",", ":"))
     except Exception:
         return str(data)
+
+
+def _parse_iso8601_utc(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -187,6 +200,7 @@ class TraderService:
         sl_order_id: Optional[int] = None,
         tp_price: Optional[float] = None,
         sl_price: Optional[float] = None,
+        opened_at: Optional[str] = None,
     ) -> None:
         existing = self.state.open_position
         if existing is not None:
@@ -200,6 +214,8 @@ class TraderService:
                 tp_price = existing.tp_price
             if sl_price is None:
                 sl_price = existing.sl_price
+            if opened_at is None:
+                opened_at = existing.opened_at
 
         self.state.open_position = OpenPositionState(
             symbol=self.symbol,
@@ -212,6 +228,7 @@ class TraderService:
             sl_order_id=int(sl_order_id) if sl_order_id is not None else None,
             tp_price=float(tp_price) if tp_price is not None else None,
             sl_price=float(sl_price) if sl_price is not None else None,
+            opened_at=str(opened_at or _utcnow_iso()),
         )
 
     def fetch_exchange_position(self) -> Tuple[str, float, float, float]:
@@ -314,7 +331,7 @@ class TraderService:
         return cls._normalize_algo_order_status(status) in ("FINISHED", "CANCELED", "REJECTED", "EXPIRED")
 
     @staticmethod
-    def _is_idempotent_cancel_error(error: Exception) -> bool:
+    def _is_retryable_not_found_error(error: Exception) -> bool:
         if isinstance(error, TestnetAPIError):
             payload = getattr(error, "payload", None)
             if isinstance(payload, dict):
@@ -327,6 +344,19 @@ class TraderService:
 
         msg = str(error).lower()
         return any(marker in msg for marker in ("does not exist", "unknown order", "not found"))
+
+    @classmethod
+    def _is_idempotent_cancel_error(cls, error: Exception) -> bool:
+        return cls._is_retryable_not_found_error(error)
+
+    @staticmethod
+    def _open_position_age_seconds(op: OpenPositionState) -> Optional[float]:
+        opened_at_dt = _parse_iso8601_utc(getattr(op, "opened_at", None))
+        if opened_at_dt is None:
+            opened_at_dt = _parse_iso8601_utc(getattr(op, "entry_time_utc", None))
+        if opened_at_dt is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - opened_at_dt).total_seconds())
 
     @staticmethod
     def _choose_runtime_exit_leg(legs: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -573,9 +603,40 @@ class TraderService:
 
         poll_errors = [leg for leg in legs.values() if leg.get("error") is not None]
         if poll_errors:
+            deferred_poll_errors: list[dict[str, Any]] = []
+            fatal_poll_errors: list[dict[str, Any]] = []
+            position_age_seconds = self._open_position_age_seconds(op)
+            for leg in poll_errors:
+                error = leg.get("error")
+                if (
+                    isinstance(error, Exception)
+                    and self._is_retryable_not_found_error(error)
+                    and position_age_seconds is not None
+                    and position_age_seconds < float(PROTECTION_POLL_GRACE_SECONDS)
+                ):
+                    deferred_poll_errors.append(leg)
+                    self.emit_event(
+                        [
+                            {
+                                "ts": _utcnow_iso(),
+                                "type": "PROTECTION_POLL_DEFERRED",
+                                "order_id": int(leg.get("order_id") or 0),
+                                "kind": str(leg.get("kind") or ""),
+                                "error": str(error),
+                                "age_seconds": float(position_age_seconds),
+                                "grace_window_seconds": int(PROTECTION_POLL_GRACE_SECONDS),
+                            }
+                        ]
+                    )
+                    continue
+                fatal_poll_errors.append(leg)
+
+            if deferred_poll_errors and not fatal_poll_errors:
+                return
+
             detail = ";".join(
                 f"{str(leg.get('kind') or '')}:{str(leg.get('error') or '')}"
-                for leg in poll_errors
+                for leg in fatal_poll_errors
             )
             self.skip_cancel_open_orders_on_exit_runtime = True
             self._trigger_protection_kill_switch(

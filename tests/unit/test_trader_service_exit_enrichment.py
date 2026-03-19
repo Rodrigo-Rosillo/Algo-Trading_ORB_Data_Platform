@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from forward.state_store_sqlite import OpenPositionState, RunnerState, SQLiteStateStore
-from forward.trader_service import TraderService
+from forward.testnet_broker import TestnetAPIError as BrokerTestnetAPIError
+from forward.trader_service import PROTECTION_POLL_GRACE_SECONDS, TraderService
 
 
 class FakeBroker:
@@ -104,6 +106,7 @@ def _seed_open_position(
     entry_price: float,
     tp_order_id: int | None,
     sl_order_id: int | None,
+    opened_at: str | None = None,
 ) -> None:
     state.open_position = OpenPositionState(
         symbol="BTCUSDT",
@@ -116,6 +119,7 @@ def _seed_open_position(
         sl_order_id=sl_order_id,
         tp_price=105.0,
         sl_price=95.0,
+        opened_at=opened_at,
     )
 
 
@@ -532,6 +536,102 @@ def test_poll_open_orders_query_exception_kills(tmp_path: Path) -> None:
     assert trader.stop_event.is_set() is True
     assert trader.skip_cancel_open_orders_on_exit_runtime is True
     assert len(_trade_log_rows(db_path, "EXIT")) == 0
+    assert len(kill_events) == 1
+
+
+def test_poll_open_orders_retryable_not_found_within_grace_is_deferred(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    emitted: list[dict[str, Any]] = []
+    opened_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    with SQLiteStateStore(db_path=db_path) as store:
+        state = store.load_state()
+        _seed_open_position(
+            state,
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            tp_order_id=2651,
+            sl_order_id=2652,
+            opened_at=opened_at,
+        )
+        store.save_state(state)
+
+        broker = FakeBroker(
+            position_amt=1.0,
+            entry_price=100.0,
+            algo_order_by_id={2652: {"algoId": 2652, "status": "NEW"}},
+            algo_order_error_by_id={
+                2651: BrokerTestnetAPIError(
+                    "Binance API error HTTP 400 code=-2013 msg=Order does not exist.",
+                    status_code=400,
+                    payload={"code": -2013, "msg": "Order does not exist."},
+                )
+            },
+        )
+        trader = _build_trader(tmp_path=tmp_path, broker=broker, store=store, state=state, emitted=emitted)
+
+        asyncio.run(trader.poll_open_orders())
+
+        reloaded = store.load_state()
+
+    deferred_events = [e for e in emitted if str(e.get("type") or "") == "PROTECTION_POLL_DEFERRED"]
+    kill_events = [e for e in emitted if str(e.get("type") or "") == "KILL_SWITCH_PROTECTION_RUNTIME"]
+    assert trader.state.open_position is not None
+    assert reloaded.open_position is not None
+    assert reloaded.open_position.opened_at == opened_at
+    assert trader.stop_event.is_set() is False
+    assert trader.skip_cancel_open_orders_on_exit_runtime is False
+    assert len(_trade_log_rows(db_path, "EXIT")) == 0
+    assert len(deferred_events) == 1
+    assert deferred_events[0]["order_id"] == 2651
+    assert deferred_events[0]["kind"] == "tp"
+    assert float(deferred_events[0]["age_seconds"]) < float(PROTECTION_POLL_GRACE_SECONDS)
+    assert len(kill_events) == 0
+
+
+def test_poll_open_orders_retryable_not_found_after_grace_kills(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    emitted: list[dict[str, Any]] = []
+    opened_at = (datetime.now(timezone.utc) - timedelta(seconds=PROTECTION_POLL_GRACE_SECONDS + 5)).isoformat()
+    with SQLiteStateStore(db_path=db_path) as store:
+        state = store.load_state()
+        _seed_open_position(
+            state,
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            tp_order_id=2661,
+            sl_order_id=2662,
+            opened_at=opened_at,
+        )
+        store.save_state(state)
+
+        broker = FakeBroker(
+            position_amt=1.0,
+            entry_price=100.0,
+            algo_order_by_id={2662: {"algoId": 2662, "status": "NEW"}},
+            algo_order_error_by_id={
+                2661: BrokerTestnetAPIError(
+                    "Binance API error HTTP 400 code=-2013 msg=Order does not exist.",
+                    status_code=400,
+                    payload={"code": -2013, "msg": "Order does not exist."},
+                )
+            },
+        )
+        trader = _build_trader(tmp_path=tmp_path, broker=broker, store=store, state=state, emitted=emitted)
+
+        asyncio.run(trader.poll_open_orders())
+
+        reloaded = store.load_state()
+
+    deferred_events = [e for e in emitted if str(e.get("type") or "") == "PROTECTION_POLL_DEFERRED"]
+    kill_events = [e for e in emitted if str(e.get("type") or "") == "KILL_SWITCH_PROTECTION_RUNTIME"]
+    assert trader.state.open_position is not None
+    assert reloaded.open_position is not None
+    assert trader.stop_event.is_set() is True
+    assert trader.skip_cancel_open_orders_on_exit_runtime is True
+    assert len(_trade_log_rows(db_path, "EXIT")) == 0
+    assert len(deferred_events) == 0
     assert len(kill_events) == 1
 
 

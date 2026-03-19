@@ -18,6 +18,7 @@ class OpenPositionState:
     sl_order_id: Optional[int] = None
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
+    opened_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

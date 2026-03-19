@@ -61,7 +61,8 @@ class OpenPositionState:
     opened_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        # Preserve the historical JSON payload shape for forward-compatibility.
+        # Keep JSON snapshots aligned with the SQLite payload so restart recovery
+        # has the same protection metadata in both places.
         return {
             "symbol": self.symbol,
             "side": self.side,
@@ -73,6 +74,7 @@ class OpenPositionState:
             "sl_order_id": self.sl_order_id,
             "tp_price": self.tp_price,
             "sl_price": self.sl_price,
+            "opened_at": self.opened_at,
         }
 
     @staticmethod
@@ -346,6 +348,8 @@ class SQLiteStateStore:
                 conn.execute("DELETE FROM open_positions WHERE id = 1")
             else:
                 op = state.open_position
+                if op.opened_at in (None, ""):
+                    op.opened_at = now
                 conn.execute(
                     """
                     INSERT INTO open_positions (
@@ -377,7 +381,7 @@ class SQLiteStateStore:
                         _coerce_int(op.sl_order_id),
                         float(op.tp_price) if op.tp_price is not None else None,
                         float(op.sl_price) if op.sl_price is not None else None,
-                        op.opened_at or now,
+                        op.opened_at,
                     ),
                 )
 
@@ -460,7 +464,7 @@ def _coerce_legacy_runner_state(legacy_state: Any) -> RunnerState:
             sl_order_id=_coerce_int(getattr(legacy_op, "sl_order_id", None)),
             tp_price=_coerce_optional_float(getattr(legacy_op, "tp_price", None)),
             sl_price=_coerce_optional_float(getattr(legacy_op, "sl_price", None)),
-            opened_at=None,
+            opened_at=getattr(legacy_op, "opened_at", None),
         )
 
     return RunnerState(

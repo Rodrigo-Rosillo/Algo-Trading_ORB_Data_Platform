@@ -10,7 +10,7 @@ from forward.testnet_broker import (
     AmbiguousOrderError,
     BinanceFuturesTestnetBroker,
     OrderValidationError,
-    TestnetAPIError,
+    TestnetAPIError as BrokerTestnetAPIError,
     classify_submit_error,
     floor_to_step,
     format_decimal,
@@ -64,7 +64,7 @@ def test_floor_to_step_and_format_decimal() -> None:
 
 
 def test_classify_submit_error_unknown_400_is_ambiguous() -> None:
-    err = TestnetAPIError(
+    err = BrokerTestnetAPIError(
         "Binance API error HTTP 400 code=-9999 msg=unexpected submit failure",
         status_code=400,
         payload={"code": -9999, "msg": "unexpected submit failure"},
@@ -73,7 +73,7 @@ def test_classify_submit_error_unknown_400_is_ambiguous() -> None:
 
 
 def test_classify_submit_error_new_order_rejected_is_definitive_reject() -> None:
-    err = TestnetAPIError(
+    err = BrokerTestnetAPIError(
         "Binance API error HTTP 400 code=-2010 msg=NEW_ORDER_REJECTED",
         status_code=400,
         payload={"code": -2010, "msg": "NEW_ORDER_REJECTED"},
@@ -82,7 +82,7 @@ def test_classify_submit_error_new_order_rejected_is_definitive_reject() -> None
 
 
 def test_classify_submit_error_rate_limit_is_transient_system() -> None:
-    err = TestnetAPIError(
+    err = BrokerTestnetAPIError(
         "Binance API error HTTP 429 code=-1003 msg=Too many requests",
         status_code=429,
         payload={"code": -1003, "msg": "Too many requests"},
@@ -91,7 +91,7 @@ def test_classify_submit_error_rate_limit_is_transient_system() -> None:
 
 
 def test_classify_submit_error_http_500_is_ambiguous() -> None:
-    err = TestnetAPIError("Binance API error HTTP 500", status_code=500, payload={})
+    err = BrokerTestnetAPIError("Binance API error HTTP 500", status_code=500, payload={})
     assert classify_submit_error(err) == "ambiguous"
 
 
@@ -188,7 +188,29 @@ def test_get_algo_open_orders_wires_expected_endpoint() -> None:
     out = broker.get_algo_open_orders(symbol="BTCUSDT")
     assert isinstance(out, list)
     assert observed["method"] == "GET"
-    assert observed["path"] == "/fapi/v1/algoOpenOrders"
+    assert observed["path"] == "/fapi/v1/openAlgoOrders"
+    assert observed["params"] == {"symbol": "BTCUSDT"}
+    assert observed["signed"] is True
+
+
+def test_cancel_all_algo_open_orders_wires_expected_endpoint() -> None:
+    broker = object.__new__(BinanceFuturesTestnetBroker)
+
+    observed: dict[str, Any] = {}
+
+    def _fake_request(method: str, path: str, *, params=None, signed=False, timeout: float = 10.0):
+        observed["method"] = method
+        observed["path"] = path
+        observed["params"] = params
+        observed["signed"] = signed
+        return {"status": "OK"}
+
+    broker._request = _fake_request  # type: ignore[method-assign]
+
+    out = broker.cancel_all_algo_open_orders(symbol="BTCUSDT")
+    assert out["status"] == "OK"
+    assert observed["method"] == "DELETE"
+    assert observed["path"] == "/fapi/v1/openAlgoOrders"
     assert observed["params"] == {"symbol": "BTCUSDT"}
     assert observed["signed"] is True
 
@@ -273,7 +295,7 @@ def test_place_market_order_recovers_duplicate_client_order_id_via_lookup() -> N
     def _fake_request(method: str, path: str, *, params=None, signed=False, timeout: float = 10.0):
         calls.append({"method": method, "path": path, "params": dict(params or {}), "signed": signed})
         if method == "POST":
-            raise TestnetAPIError(
+            raise BrokerTestnetAPIError(
                 "Binance API error HTTP 400 code=-4116 msg=client order id is duplicated",
                 status_code=400,
                 payload={"code": -4116, "msg": "client order id is duplicated"},
@@ -301,8 +323,8 @@ def test_place_market_order_raises_ambiguous_when_lookup_fails() -> None:
     def _fake_request(method: str, path: str, *, params=None, signed=False, timeout: float = 10.0):
         calls.append({"method": method, "path": path, "params": dict(params or {}), "signed": signed})
         if method == "POST":
-            raise TestnetAPIError("Network error after retries: timeout")
-        raise TestnetAPIError(
+            raise BrokerTestnetAPIError("Network error after retries: timeout")
+        raise BrokerTestnetAPIError(
             "Binance API error HTTP 400 code=-2013 msg=Order does not exist.",
             status_code=400,
             payload={"code": -2013, "msg": "Order does not exist."},
