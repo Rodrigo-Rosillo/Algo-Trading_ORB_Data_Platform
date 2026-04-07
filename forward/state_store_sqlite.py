@@ -129,6 +129,71 @@ class RunnerState:
         )
 
 
+# ---------------------------------------------------------------------------
+# Schema migrations
+# ---------------------------------------------------------------------------
+# Each entry is (version, sql_statement).  Migrations are applied in order.
+# ``init_schema`` creates the ``schema_version`` bookkeeping table, reads the
+# current version, then executes every migration whose version is strictly
+# greater than the stored version — all inside a single transaction.
+#
+# To add a new migration: append a tuple with the next sequential version
+# number and the DDL/DML SQL string.  The runner handles the rest.
+# ---------------------------------------------------------------------------
+
+MIGRATIONS: list[tuple[int, str]] = [
+    (
+        1,
+        """
+        CREATE TABLE IF NOT EXISTS runner_state (
+          id INTEGER PRIMARY KEY,
+          last_bar_open_time_utc TEXT,
+          bars_processed INTEGER,
+          current_day_utc TEXT,
+          order_rejects_today INTEGER,
+          daily_loss_halted INTEGER,
+          drawdown_halted INTEGER,
+          updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS open_positions (
+          id INTEGER PRIMARY KEY,
+          symbol TEXT,
+          side TEXT,
+          qty REAL,
+          entry_price REAL,
+          entry_time_utc TEXT,
+          entry_order_id INTEGER,
+          tp_order_id INTEGER,
+          sl_order_id INTEGER,
+          tp_price REAL,
+          sl_price REAL,
+          opened_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_type TEXT,
+          symbol TEXT,
+          side TEXT,
+          qty REAL,
+          price REAL,
+          realized_pnl REAL,
+          fee REAL,
+          funding_applied REAL,
+          reason TEXT,
+          bar_time_utc TEXT,
+          recorded_at TEXT
+        );
+        """,
+    ),
+    # -- future migrations go here --
+    # (2, "ALTER TABLE trade_log ADD COLUMN order_id INTEGER;"),
+]
+
+SCHEMA_VERSION = MIGRATIONS[-1][0]
+
+
 class SQLiteStateStore:
     def __init__(self, db_path: Path, events_path: Optional[Path] = None):
         self.db_path = Path(db_path)
@@ -191,58 +256,79 @@ class SQLiteStateStore:
     def __exit__(self, *args) -> None:
         self.close()
 
-    def init_schema(self) -> None:
-        conn = self._require_conn()
+    def _get_schema_version(self, conn: sqlite3.Connection) -> int:
+        """Return the current schema version, or 0 if no version table exists."""
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        ).fetchone()
+        if row is None:
+            return 0
+        version_row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+        if version_row is None:
+            return 0
+        return int(version_row[0])
+
+    def _set_schema_version(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS runner_state (
+            INSERT INTO schema_version (id, version, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              version = excluded.version,
+              updated_at = excluded.updated_at
+            """,
+            (version, _utcnow_iso()),
+        )
+
+    def init_schema(self) -> None:
+        conn = self._require_conn()
+
+        # Ensure the version-tracking table exists (idempotent).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
               id INTEGER PRIMARY KEY,
-              last_bar_open_time_utc TEXT,
-              bars_processed INTEGER,
-              current_day_utc TEXT,
-              order_rejects_today INTEGER,
-              daily_loss_halted INTEGER,
-              drawdown_halted INTEGER,
+              version INTEGER NOT NULL,
               updated_at TEXT
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS open_positions (
-              id INTEGER PRIMARY KEY,
-              symbol TEXT,
-              side TEXT,
-              qty REAL,
-              entry_price REAL,
-              entry_time_utc TEXT,
-              entry_order_id INTEGER,
-              tp_order_id INTEGER,
-              sl_order_id INTEGER,
-              tp_price REAL,
-              sl_price REAL,
-              opened_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trade_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              event_type TEXT,
-              symbol TEXT,
-              side TEXT,
-              qty REAL,
-              price REAL,
-              realized_pnl REAL,
-              fee REAL,
-              funding_applied REAL,
-              reason TEXT,
-              bar_time_utc TEXT,
-              recorded_at TEXT
-            )
-            """
-        )
+
+        current_version = self._get_schema_version(conn)
+
+        # Detect a pre-versioning database: tables exist but no version row.
+        if current_version == 0:
+            has_runner = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='runner_state'"
+            ).fetchone()
+            if has_runner is not None:
+                # Existing database created before versioning was added.
+                # Mark it as v1 so migrations 2+ will still run.
+                current_version = 1
+                self._set_schema_version(conn, current_version)
+                self._emit_event(
+                    "SCHEMA_BACKFILL",
+                    version=current_version,
+                    detail="pre-versioning database detected, stamped as v1",
+                )
+
+        pending = [(v, sql) for v, sql in MIGRATIONS if v > current_version]
+        if not pending:
+            return
+
+        try:
+            conn.execute("BEGIN")
+            for version, sql in pending:
+                conn.executescript(sql)
+                self._emit_event("SCHEMA_MIGRATE", from_version=current_version, to_version=version)
+            self._set_schema_version(conn, pending[-1][0])
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def integrity_check_or_raise(self) -> None:
         conn = self._require_conn()
