@@ -79,6 +79,7 @@ def _order_exec_qty(resp: Any) -> float:
 PROTECTION_RECENCY_WINDOW_SECONDS = 180
 PROTECTION_AMBIGUITY_RETRY_WINDOW_SECONDS = 30
 PROTECTION_POLL_GRACE_SECONDS = 10
+PROTECTION_RACE_DEFER_GRACE_SECONDS = 30
 PROTECTION_PRICE_TOL_TICKS = 1
 ENTRY_AMBIGUITY_VERIFY_ATTEMPTS = 3
 ENTRY_AMBIGUITY_VERIFY_SLEEP_SECONDS = 0.5
@@ -504,6 +505,32 @@ class TraderService:
                     for kind, leg in legs.items()
                     if str(leg.get("status") or "") != "" or leg.get("error") is not None
                 }
+                if not finished:
+                    non_terminal_legs = [
+                        leg
+                        for leg in legs.values()
+                        if leg.get("error") is None
+                        and not self._is_algo_order_terminal_status(str(leg.get("status") or ""))
+                    ]
+                    if non_terminal_legs:
+                        position_age_seconds = self._open_position_age_seconds(op)
+                        if (
+                            position_age_seconds is not None
+                            and position_age_seconds < float(PROTECTION_RACE_DEFER_GRACE_SECONDS)
+                        ):
+                            self.emit_event(
+                                [
+                                    {
+                                        "ts": _utcnow_iso(),
+                                        "type": "PROTECTION_POLL_DEFERRED",
+                                        "reason": "flat_leg_pending",
+                                        "statuses": statuses,
+                                        "age_seconds": float(position_age_seconds),
+                                        "grace_window_seconds": int(PROTECTION_RACE_DEFER_GRACE_SECONDS),
+                                    }
+                                ]
+                            )
+                            return
                 if len(finished) >= 2:
                     self.emit_event(
                         [

@@ -10,7 +10,11 @@ import pytest
 
 from forward.state_store_sqlite import OpenPositionState, RunnerState, SQLiteStateStore
 from forward.testnet_broker import TestnetAPIError as BrokerTestnetAPIError
-from forward.trader_service import PROTECTION_POLL_GRACE_SECONDS, TraderService
+from forward.trader_service import (
+    PROTECTION_POLL_GRACE_SECONDS,
+    PROTECTION_RACE_DEFER_GRACE_SECONDS,
+    TraderService,
+)
 
 
 class FakeBroker:
@@ -446,20 +450,89 @@ def test_poll_open_orders_both_finished_prefers_tp_once(tmp_path: Path) -> None:
     assert any(str(e.get("reason") or "") == "dual_finished" for e in anomaly_events)
 
 
-def test_poll_open_orders_terminal_flat_race_treated_as_normal_close(tmp_path: Path) -> None:
+def test_poll_open_orders_flat_leg_pending_defers_then_resolves_to_sl(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     emitted: list[dict[str, Any]] = []
     with SQLiteStateStore(db_path=db_path) as store:
         state = store.load_state()
-        _seed_open_position(state, side="LONG", qty=1.0, entry_price=100.0, tp_order_id=2401, sl_order_id=2402)
+        recent_opened_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        _seed_open_position(
+            state,
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            tp_order_id=2401,
+            sl_order_id=2402,
+            opened_at=recent_opened_at,
+        )
+        state.open_position.entry_time_utc = recent_opened_at
         store.save_state(state)
 
         broker = FakeBroker(
             position_amt=0.0,
             entry_price=100.0,
             algo_order_by_id={
-                2401: {"algoId": 2401, "status": "CANCELED"},
-                2402: {"algoId": 2402, "status": "NEW"},
+                2401: {"algoId": 2401, "status": "EXPIRED"},
+                2402: {"algoId": 2402, "status": "TRIGGERING"},
+            },
+        )
+        trader = _build_trader(tmp_path=tmp_path, broker=broker, store=store, state=state, emitted=emitted)
+
+        asyncio.run(trader.poll_open_orders())
+
+        defer_events = [e for e in emitted if str(e.get("type") or "") == "PROTECTION_POLL_DEFERRED"]
+        assert len(defer_events) == 1
+        assert str(defer_events[0].get("reason") or "") == "flat_leg_pending"
+        assert trader.state.open_position is not None
+        assert trader.stop_event.is_set() is False
+        assert broker.cancel_algo_calls == []
+        assert len(_trade_log_rows(db_path, "EXIT")) == 0
+
+        broker.algo_order_by_id[2402] = {
+            "algoId": 2402,
+            "status": "FINISHED",
+            "avgPrice": "95.0",
+            "executedQty": "1.0",
+        }
+
+        asyncio.run(trader.poll_open_orders())
+
+        reloaded = store.load_state()
+
+    assert trader.state.open_position is None
+    assert reloaded.open_position is None
+    assert trader.stop_event.is_set() is False
+    assert trader.skip_cancel_open_orders_on_exit_runtime is False
+    assert _latest_exit_row(db_path)["reason"] == "sl"
+
+
+def test_poll_open_orders_flat_leg_pending_grace_expiry_falls_through(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    emitted: list[dict[str, Any]] = []
+    with SQLiteStateStore(db_path=db_path) as store:
+        state = store.load_state()
+        stale_opened_at = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=PROTECTION_RACE_DEFER_GRACE_SECONDS + 5)
+        ).isoformat()
+        _seed_open_position(
+            state,
+            side="LONG",
+            qty=1.0,
+            entry_price=100.0,
+            tp_order_id=2411,
+            sl_order_id=2412,
+            opened_at=stale_opened_at,
+        )
+        state.open_position.entry_time_utc = stale_opened_at
+        store.save_state(state)
+
+        broker = FakeBroker(
+            position_amt=0.0,
+            entry_price=100.0,
+            algo_order_by_id={
+                2411: {"algoId": 2411, "status": "EXPIRED"},
+                2412: {"algoId": 2412, "status": "NEW"},
             },
         )
         trader = _build_trader(tmp_path=tmp_path, broker=broker, store=store, state=state, emitted=emitted)
@@ -468,12 +541,12 @@ def test_poll_open_orders_terminal_flat_race_treated_as_normal_close(tmp_path: P
 
         reloaded = store.load_state()
 
+    defer_events = [e for e in emitted if str(e.get("type") or "") == "PROTECTION_POLL_DEFERRED"]
     anomaly_events = [e for e in emitted if str(e.get("type") or "") == "PROTECTION_RUNTIME_ANOMALY"]
+    assert defer_events == []
     assert trader.state.open_position is None
     assert reloaded.open_position is None
-    assert trader.stop_event.is_set() is False
-    assert trader.skip_cancel_open_orders_on_exit_runtime is False
-    assert broker.cancelled_algo_ids == [2402]
+    assert broker.cancelled_algo_ids == [2412]
     assert _latest_exit_row(db_path)["reason"] == "tp"
     assert any(str(e.get("reason") or "") == "terminal_flat_race" for e in anomaly_events)
 
