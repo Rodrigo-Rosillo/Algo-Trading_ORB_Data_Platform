@@ -667,7 +667,7 @@ class BinanceFuturesTestnetBroker:
             "side": side,
             "type": "STOP_MARKET",
             "triggerPrice": stop_sent,
-            "workingType": "MARK_PRICE",
+            "workingType": "CONTRACT_PRICE",
             "newOrderRespType": "RESULT",
             "clientAlgoId": str(client_algo_id or self._make_client_id("sl")),
         }
@@ -710,7 +710,7 @@ class BinanceFuturesTestnetBroker:
             "side": side,
             "type": "TAKE_PROFIT_MARKET",
             "triggerPrice": stop_sent,
-            "workingType": "MARK_PRICE",
+            "workingType": "CONTRACT_PRICE",
             "newOrderRespType": "RESULT",
             "clientAlgoId": str(client_algo_id or self._make_client_id("tp")),
         }

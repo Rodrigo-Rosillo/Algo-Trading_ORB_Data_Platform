@@ -179,6 +179,13 @@ The platform still includes operational monitoring helpers for deployed runs:
 
 See `RUNBOOK.md` for deployment and monitoring details.
 
+## Execution Notes (Testnet/Live)
+
+Protective SL and TP orders are submitted with `workingType: CONTRACT_PRICE` (last traded price) in [forward/testnet_broker.py](forward/testnet_broker.py). Trade-offs:
+
+- `CONTRACT_PRICE`: triggers on the last trade. Matches what you would actually fill at, but is more sensitive to wicks and spread noise on thin books, so brief spikes can fire the bracket.
+- `MARK_PRICE`: triggers on Binance's smoothed mark. Resists wick-only triggers, but can diverge from last-trade so the bracket may not fire even when your fill price already crossed the level (and is liquidation-aligned).
+
 ## Data Layout
 
 - [data/README.md](data/README.md)
