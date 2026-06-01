@@ -88,6 +88,7 @@ class FakeDataService:
         heartbeat_seconds: int,
         emit_event: Any,
         on_kill_switch: Any = None,
+        data_source: str = "ws",
     ) -> None:
         _ = (
             symbol,
@@ -99,6 +100,7 @@ class FakeDataService:
             heartbeat_seconds,
             emit_event,
             on_kill_switch,
+            data_source,
         )
         self.connect_count = 1
         self.last_closed_bar_at = None

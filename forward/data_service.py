@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Optional
 
-from forward.binance_live import BinanceLiveKlineSource
+from forward.binance_live import BinanceLiveKlineSource, BinanceRestKlineSource
 from forward.risk_engine import RiskDecision, check_data_staleness
 
 
@@ -24,6 +24,7 @@ class DataService:
         heartbeat_seconds: int,
         emit_event: Callable[[list[dict]], None],
         on_kill_switch: Optional[Callable[[str, str], None]] = None,
+        data_source: str = "ws",
     ):
         self.symbol = symbol
         self.stale_allowed_seconds = float(stale_allowed_seconds)
@@ -32,16 +33,29 @@ class DataService:
         self.emit_event = emit_event
         self.on_kill_switch = on_kill_switch
         self.last_closed_bar_at: Optional[datetime] = None
-        self._src = BinanceLiveKlineSource(
-            symbol=symbol,
-            interval=interval,
-            market=market,
-            max_backoff_seconds=max_backoff_seconds,
-        )
+        self.data_source = str(data_source or "ws").strip().lower()
+        if self.data_source == "rest":
+            self._src = BinanceRestKlineSource(
+                symbol=symbol,
+                interval=interval,
+                market=market,
+                max_backoff_seconds=max_backoff_seconds,
+            )
+        else:
+            self._src = BinanceLiveKlineSource(
+                symbol=symbol,
+                interval=interval,
+                market=market,
+                max_backoff_seconds=max_backoff_seconds,
+            )
 
     @property
     def connect_count(self) -> int:
         return int(self._src.connect_count)
+
+    @property
+    def kind(self) -> str:
+        return str(getattr(self._src, "kind", "ws"))
 
     async def stream_closed(self, stop_event: asyncio.Event) -> AsyncIterator[Any]:
         async for bar in self._src.stream_closed(stop_event=stop_event):

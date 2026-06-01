@@ -172,6 +172,7 @@ async def run_live_testnet(
 
     live_cfg = ft_cfg.get("live") if isinstance(ft_cfg.get("live"), dict) else {}
     market = str((live_cfg or {}).get("market", "futures"))
+    data_source = str((live_cfg or {}).get("data_source", "ws")).strip().lower()
     bootstrap_limit = int((live_cfg or {}).get("bootstrap_limit", 1000))
     max_backoff_seconds = int((live_cfg or {}).get("max_backoff_seconds", 60))
     heartbeat_seconds = int((live_cfg or {}).get("heartbeat_seconds", 120))
@@ -613,6 +614,7 @@ async def run_live_testnet(
             heartbeat_seconds=int(heartbeat_seconds),
             emit_event=emit_event,
             on_kill_switch=on_data_kill_switch,
+            data_source=data_source,
         )
 
         last_connect_count = data_service.connect_count

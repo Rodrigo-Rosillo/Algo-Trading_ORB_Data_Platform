@@ -49,6 +49,7 @@ forward_test:
   bar_lookback: 1000
   live:
     market: futures
+    data_source: ws          # ws | rest  (rest = adaptive REST poller; WS-IP-blocked fallback)
     bootstrap_limit: 1000
     bootstrap_max_age_bars: null
     max_backoff_seconds: 60
