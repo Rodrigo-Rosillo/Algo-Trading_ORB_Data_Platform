@@ -167,6 +167,7 @@ SELECT e.id              AS entry_id,
        x.fee             AS exit_fee,
        x.realized_pnl    AS realized_pnl,
        x.funding_applied AS funding_applied,
+       x.reason          AS exit_reason,
        x.bar_time_utc    AS exit_time
 FROM trade_log e
 JOIN trade_log x ON x.id = (
@@ -174,17 +175,93 @@ JOIN trade_log x ON x.id = (
     WHERE id > e.id
       AND event_type = 'EXIT'
       AND symbol = e.symbol
+      AND realized_pnl IS NOT NULL
+      AND id < COALESCE(
+            (SELECT MIN(id) FROM trade_log
+             WHERE id > e.id
+               AND event_type = 'ENTRY'
+               AND symbol = e.symbol),
+            9223372036854775807)
 )
 WHERE e.event_type = 'ENTRY'
   AND x.realized_pnl IS NOT NULL
 ORDER BY e.id DESC
 LIMIT ?
 """
+    # Matching notes:
+    #   * The subquery pairs each ENTRY with its *next EXIT that carries a
+    #     non-null realized_pnl*. This skips phantom exit rows written with
+    #     NULL realized_pnl by enrichment-failure / emergency-flatten paths,
+    #     which would otherwise be selected and then dropped by the outer
+    #     filter — silently deleting a real, completed trade from the report.
+    #   * The `id < next-ENTRY-id` bound stops an entry whose only exit is a
+    #     phantom from stealing (and double-counting) a later entry's real
+    #     exit. Such an un-enrichable trade is left out rather than mispaired.
+    #   * Non-trade event rows (KILL_SWITCH, REJECT, ENTRY_FAILED, ...) are
+    #     ignored because only event_type='ENTRY'/'EXIT' rows participate.
 
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, (max(1, int(n)),)).fetchall()
     return [dict(r) for r in rows]
+
+
+def _net_pnl(realized_pnl, funding_applied) -> float:
+    """Realized PnL net of funding, matching the windowed metric's semantics.
+
+    realized_pnl is already net-of-fees (Option A); funding_applied is a
+    separate adjustment subtracted on top. Fee columns are NOT subtracted again.
+    """
+    return float(realized_pnl) - float(funding_applied or 0.0)
+
+
+def _load_all_time_net(db_path: Path) -> dict:
+    """Total realized PnL (net of fees and funding) across ALL completed trades.
+
+    A completed trade is an EXIT row with a non-null realized_pnl, so this is
+    immune to the rolling-window churn and counts phantom NULL-pnl exits out.
+    """
+    sql = """
+SELECT COUNT(*)                                              AS n,
+       COALESCE(SUM(realized_pnl - COALESCE(funding_applied, 0.0)), 0.0) AS net
+FROM trade_log
+WHERE event_type = 'EXIT'
+  AND realized_pnl IS NOT NULL
+"""
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(sql).fetchone()
+    if row is None:
+        return {"count": 0, "net": 0.0}
+    return {"count": int(row["n"] or 0), "net": float(row["net"] or 0.0)}
+
+
+def _load_latest_trade(db_path: Path) -> dict | None:
+    """The single most recently closed trade (latest non-phantom EXIT row).
+
+    Surfaces its net PnL and exit reason so the report makes clear whether the
+    most recent close was a win or a loss, independent of window churn.
+    """
+    sql = """
+SELECT symbol, side, realized_pnl, funding_applied, reason, bar_time_utc
+FROM trade_log
+WHERE event_type = 'EXIT'
+  AND realized_pnl IS NOT NULL
+ORDER BY id DESC
+LIMIT 1
+"""
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(sql).fetchone()
+    if row is None:
+        return None
+    return {
+        "symbol": row["symbol"],
+        "side": row["side"],
+        "net": _net_pnl(row["realized_pnl"], row["funding_applied"]),
+        "reason": row["reason"],
+        "exit_time": row["bar_time_utc"],
+    }
 
 
 def _compute_metrics(trades: list[dict]) -> dict:
@@ -311,12 +388,34 @@ def _compute_metrics(trades: list[dict]) -> dict:
     }
 
 
+def _format_latest_line(latest: dict | None) -> str:
+    if not latest:
+        return "Latest trade:    N/A"
+    reason = str(latest.get("reason") or "?")
+    return f"Latest trade:    {float(latest.get('net') or 0.0):+.2f} USD ({reason})"
+
+
+def _format_all_time_line(all_time: dict | None) -> str:
+    if not all_time:
+        return "All-time net:    N/A"
+    return (
+        f"All-time net:    {float(all_time.get('net') or 0.0):+.2f} USD"
+        f"  ({int(all_time.get('count') or 0)} trades)"
+    )
+
+
 def _format_message(metrics: dict, symbol: str, report_dt: str) -> str:
     n = int(metrics.get("n") or 0)
+    latest = metrics.get("latest_trade")
+    all_time = metrics.get("all_time")
     if metrics.get("insufficient"):
-        return (
-            f"📊 Daily Report — {symbol} — {report_dt}\n"
-            f"Insufficient data ({n} completed trades in trade_log)."
+        return "\n".join(
+            [
+                f"📊 Daily Report — {symbol} — {report_dt}",
+                f"Insufficient data ({n} completed trades in trade_log).",
+                _format_latest_line(latest),
+                _format_all_time_line(all_time),
+            ]
         )
 
     freq = metrics.get("freq_per_day")
@@ -339,11 +438,13 @@ def _format_message(metrics: dict, symbol: str, report_dt: str) -> str:
             f"📊 Daily Report — {symbol} — {report_dt}",
             f"Rolling last {n} trades | Span: {metrics.get('span_str')}",
             f"Frequency: {freq_str}",
+            _format_latest_line(latest),
             "",
             f"Wins / Losses:   {int(metrics.get('wins') or 0)} / {int(metrics.get('losses') or 0)}",
             f"Win rate:        {float(metrics.get('win_rate') or 0.0):.1%}",
             f"Profit factor:   {pf_str}         (∞ if no losers)",
-            f"Net return:      {float(metrics.get('net_return') or 0.0):+.2f} USD",
+            f"Window net:      {float(metrics.get('net_return') or 0.0):+.2f} USD (last {n} trades)",
+            _format_all_time_line(all_time),
             "",
             f"Sharpe*:         {sharpe_str}     (* per-trade, not annualised)",
             f"Sortino*:        {sortino_str}",
@@ -371,14 +472,22 @@ def main() -> int:
 
     try:
         trades_desc = _load_trades(db_path=db_path, n=int(args.n))
+        latest_trade = _load_latest_trade(db_path)
+        all_time = _load_all_time_net(db_path)
     except Exception as e:
         print(f"ERROR: Failed to load trades from {db_path}: {e}", file=sys.stderr)
         return 1
 
     trades = list(reversed(trades_desc))
     metrics = _compute_metrics(trades)
+    metrics["latest_trade"] = latest_trade
+    metrics["all_time"] = all_time
 
-    symbol = str(metrics.get("symbol") or "UNKNOWN")
+    symbol = str(
+        metrics.get("symbol")
+        or (latest_trade or {}).get("symbol")
+        or "UNKNOWN"
+    )
     report_dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     message = _format_message(metrics, symbol, report_dt)
 
