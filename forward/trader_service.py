@@ -83,6 +83,12 @@ PROTECTION_RACE_DEFER_GRACE_SECONDS = 30
 PROTECTION_PRICE_TOL_TICKS = 1
 ENTRY_AMBIGUITY_VERIFY_ATTEMPTS = 3
 ENTRY_AMBIGUITY_VERIFY_SLEEP_SECONDS = 0.5
+# When a market entry response comes back without a usable avgPrice (e.g. Binance
+# returns an ACK-style payload), re-fetch the real fill price from the exchange
+# position before computing the bracket. A zero entry price silently collapses any
+# entry_pct-based take-profit to 0.0.
+ENTRY_PRICE_RECOVERY_ATTEMPTS = 3
+ENTRY_PRICE_RECOVERY_SLEEP_SECONDS = 0.5
 POSITION_RECON_QTY_TOLERANCE = 1e-6
 
 def _compact_json(data: Any) -> str:
@@ -1594,6 +1600,66 @@ class TraderService:
         )
         return None
 
+    async def _recover_entry_fill_price(
+        self,
+        *,
+        initial_price: float,
+        pos_side: str,
+        signal_type: str,
+    ) -> float:
+        """Re-fetch the real average entry price from the exchange position.
+
+        A market entry response sometimes returns without a usable ``avgPrice``
+        (e.g. an ACK-style payload), leaving ``entry_price`` at 0.0. Any
+        ``entry_pct`` take-profit then collapses to 0.0 and trips the
+        protection-missing emergency flatten. Poll the exchange position a few
+        times to recover the genuine fill price; return the first positive value
+        found, otherwise fall back to ``initial_price``.
+        """
+        attempts: list[dict[str, Any]] = []
+        for attempt in range(int(ENTRY_PRICE_RECOVERY_ATTEMPTS)):
+            if attempt > 0:
+                await asyncio.sleep(float(ENTRY_PRICE_RECOVERY_SLEEP_SECONDS))
+            try:
+                ex_side, ex_qty, ex_entry, _ = self.fetch_exchange_position()
+            except Exception as fetch_err:
+                attempts.append({"attempt": int(attempt + 1), "error": str(fetch_err)})
+                continue
+            attempts.append(
+                {
+                    "attempt": int(attempt + 1),
+                    "side": str(ex_side),
+                    "qty": float(ex_qty),
+                    "entry_price": float(ex_entry),
+                }
+            )
+            if str(ex_side) == str(pos_side) and float(ex_qty) > 1e-9 and float(ex_entry) > 0:
+                self._emit_event_best_effort(
+                    [
+                        {
+                            "ts": _utcnow_iso(),
+                            "type": "ENTRY_PRICE_RECOVERED",
+                            "signal_type": str(signal_type),
+                            "recovered_entry_price": float(ex_entry),
+                            "details": {"attempts": attempts},
+                        }
+                    ]
+                )
+                return float(ex_entry)
+
+        self._emit_event_best_effort(
+            [
+                {
+                    "ts": _utcnow_iso(),
+                    "type": "ENTRY_PRICE_RECOVERY_FAILED",
+                    "signal_type": str(signal_type),
+                    "initial_price": float(initial_price),
+                    "details": {"attempts": attempts},
+                }
+            ]
+        )
+        return float(initial_price)
+
     async def maybe_place_trade_from_signal(self, bar_open_time: pd.Timestamp, row: pd.Series) -> None:
         if self.state.open_position is not None:
             return
@@ -1816,6 +1882,12 @@ class TraderService:
 
         entry_oid = _extract_order_id(entry_resp)
         entry_price = _order_avg_price(entry_resp)
+        if entry_price <= 0:
+            entry_price = await self._recover_entry_fill_price(
+                initial_price=float(entry_price),
+                pos_side=pos_side,
+                signal_type=signal_type,
+            )
         exec_qty = _order_exec_qty(entry_resp)
         entry_qty = float(exec_qty or qty_sent)
 
@@ -1914,6 +1986,52 @@ class TraderService:
         )
         sl_price = float(execution_plan.stop_loss)
         tp_price = float(execution_plan.target_price)
+
+        # Backstop: never send a protective order at a non-positive price. This
+        # normally only happens if entry-price recovery failed and an entry_pct
+        # target collapsed to 0.0. Flatten immediately with a clear reason rather
+        # than submit a doomed 0-price order and rely on exchange rejection.
+        if not (tp_price > 0 and sl_price > 0):
+            invalid_reason = "invalid_bracket_price"
+            self._emit_event_best_effort(
+                [
+                    {
+                        "ts": _utcnow_iso(),
+                        "type": "BRACKET_SKIPPED",
+                        "reason": invalid_reason,
+                        "details": {
+                            "entry_price": float(entry_price),
+                            "tp_price": float(tp_price),
+                            "sl_price": float(sl_price),
+                            "signal_type": str(signal_type),
+                        },
+                    }
+                ]
+            )
+            flatten_ok, flatten_detail = self._emergency_flatten(
+                reason=invalid_reason,
+                known_qty=float(entry_qty),
+                known_side=pos_side,
+            )
+            if flatten_ok:
+                self.state.open_position = None
+            else:
+                self._set_open_position_state(
+                    side=pos_side,
+                    qty=float(entry_qty),
+                    entry_price=float(entry_price),
+                    entry_time_utc=entry_time_utc,
+                    entry_order_id=int(entry_oid) if entry_oid is not None else None,
+                )
+            self.persist_state()
+            if not flatten_ok:
+                self.skip_cancel_open_orders_on_exit_runtime = True
+                self._trigger_protection_kill_switch(
+                    "KILL_SWITCH_UNPROTECTED_POSITION",
+                    f"{invalid_reason}:{flatten_detail}",
+                )
+            return
+
         exit_side = "BUY" if pos_side == "SHORT" else "SELL"
         tp_sent_price = float(tp_price)
         sl_sent_price = float(sl_price)
